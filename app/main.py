@@ -1,27 +1,26 @@
 import asyncio
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.disclosure.monitor import DisclosureMonitor
+from app.logging_config import configure_logging
 from app.notification.publisher import NotificationEvent
 from app.notification.telegram import TelegramNotificationPublisher
+from app.ops import TelegramCommandMonitor
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s "
-        "[%(levelname)s] "
-        "%(name)s - %(message)s"
-    )
-)
+configure_logging()
 
 
 telegram_publisher = TelegramNotificationPublisher()
 monitor = DisclosureMonitor(
     notification_publisher=telegram_publisher
+)
+telegram_command_monitor = TelegramCommandMonitor(
+    trading_service=monitor.trading_service,
+    notification_publisher=telegram_publisher,
+    on_failure=monitor._publish_failure_alert,
 )
 
 
@@ -30,15 +29,25 @@ async def lifespan(app: FastAPI):
     polling_task = asyncio.create_task(
         monitor.start()
     )
+    command_task = asyncio.create_task(
+        telegram_command_monitor.start()
+    )
 
     try:
         yield
     finally:
+        await telegram_command_monitor.stop()
         await monitor.stop()
         polling_task.cancel()
+        command_task.cancel()
 
         try:
             await polling_task
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            await command_task
         except asyncio.CancelledError:
             pass
 
@@ -57,23 +66,41 @@ async def health():
         "dart_polling": monitor.running,
         "telegram_alert_enabled": telegram_publisher.enabled,
         "telegram_configured": telegram_publisher.configured,
+        "telegram_commands_running": telegram_command_monitor.running,
+        "auto_buy_enabled": monitor.trading_service.auto_buy_enabled,
+        "auto_buy_dry_run": monitor.trading_service.dry_run,
     }
 
 
 @app.get("/dart/status")
 async def dart_status():
-    browser = monitor.browser
-
-    if not browser.page:
-        return {
-            "running": False,
-        }
-
     return {
         "running": monitor.running,
-        "url": browser.page.url,
+        "polling_time": monitor.service.is_polling_time(),
+        "polling_start": monitor.service.polling_start.strftime("%H:%M"),
+        "polling_end": monitor.service.polling_end.strftime("%H:%M"),
+        "polling_weekdays_only": monitor.service.polling_weekdays_only,
         "seen_rcp_nos": sorted(monitor.service.seen_rcp_nos),
     }
+
+
+@app.get("/trading/status")
+async def trading_status():
+    return monitor.trading_service.status()
+
+
+@app.post("/ops/auto-buy/enable")
+async def enable_auto_buy():
+    await monitor.trading_service.set_auto_buy_enabled(True)
+
+    return monitor.trading_service.status()
+
+
+@app.post("/ops/auto-buy/disable")
+async def disable_auto_buy():
+    await monitor.trading_service.set_auto_buy_enabled(False)
+
+    return monitor.trading_service.status()
 
 
 @app.get("/ops/telegram-alert")

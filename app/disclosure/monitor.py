@@ -1,14 +1,16 @@
 import asyncio
 import logging
 
-from app.disclosure.browser import DartBrowser
-from app.disclosure.parser import parse_disclosure_detail
 from app.disclosure.service import DisclosureService
 from app.notification.publisher import (
     LoggingNotificationPublisher,
     NotificationEvent,
     NotificationPublisher,
 )
+from app.notification.alert_manager import AlertManager
+from app.trading import TradingService
+from app.trading.fill_websocket import FillEvent
+from app.trading.service import TradingResult
 
 
 logger = logging.getLogger(__name__)
@@ -21,20 +23,34 @@ class DisclosureMonitor:
     def __init__(
         self,
         notification_publisher: NotificationPublisher | None = None,
+        trading_service: TradingService | None = None,
     ):
-        self.browser = DartBrowser()
         self.service = DisclosureService()
         self.notification_publisher = (
             notification_publisher or LoggingNotificationPublisher()
         )
+        self.alert_manager = AlertManager(self.notification_publisher)
+        self.trading_service = trading_service or TradingService(
+            fill_handler=self._publish_fill_event,
+            failure_handler=self._publish_failure_alert,
+        )
         self.running = False
 
     async def start(self):
-        await self.browser.start()
+        self.trading_service.start_fill_stream()
 
-        initial_disclosures = await self.service.find_new_disclosures(
-            self.browser.page
-        )
+        initial_disclosures = []
+
+        if self.service.is_polling_time():
+            try:
+                initial_disclosures = await self.service.find_new_disclosures()
+            except Exception as exc:
+                logger.exception("DART initial polling failed")
+                await self._publish_failure_alert(
+                    key="dart.initial_polling",
+                    title="[장애] DART 초기 조회 실패",
+                    body=f"{type(exc).__name__}: {exc}",
+                )
 
         logger.info(
             "DART disclosure monitor initialized | initial_new_count=%s",
@@ -45,7 +61,7 @@ class DisclosureMonitor:
 
         self.running = True
 
-        logger.info("DART My disclosure monitoring started")
+        logger.info("DART disclosure monitoring started")
 
         while self.running:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -57,20 +73,18 @@ class DisclosureMonitor:
                 logger.exception(
                     "DART polling failed"
                 )
+                await self._publish_failure_alert(
+                    key="dart.polling",
+                    title="[장애] DART polling 실패",
+                    body="DART 공시 조회 중 오류가 발생했습니다. 로그를 확인하세요.",
+                )
 
     async def _poll_once(self):
-        response = await self.browser.reload()
+        if not self.service.is_polling_time():
+            logger.info("DART polling skipped outside configured polling time")
+            return []
 
-        logger.info(
-            "DART polling status=%s",
-            response.status if response else None
-        )
-
-        new_disclosures = (
-            await self.service.find_new_disclosures(
-                self.browser.page
-            )
-        )
+        new_disclosures = await self.service.find_new_disclosures()
 
         if not new_disclosures:
             return []
@@ -81,17 +95,33 @@ class DisclosureMonitor:
         self,
         disclosures: list[dict],
     ):
-        details = []
+        processed_disclosures = []
 
         for disclosure in disclosures:
-            detail = await self._process_new_disclosure(
-                disclosure
-            )
+            try:
+                processed = await self._process_new_disclosure(
+                    disclosure
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Disclosure processing failed | rcpNo=%s",
+                    disclosure.get("rcp_no"),
+                )
+                await self._publish_failure_alert(
+                    key=f"disclosure.process.{disclosure.get('rcp_no')}",
+                    title="[장애] 공시 처리 실패",
+                    body=(
+                        f"접수번호: {disclosure.get('rcp_no') or '-'}\n"
+                        f"종목코드: {disclosure.get('stock_code') or '-'}\n"
+                        f"오류: {type(exc).__name__}: {exc}"
+                    ),
+                )
+                processed = None
 
-            if detail:
-                details.append(detail)
+            if processed:
+                processed_disclosures.append(processed)
 
-        return details
+        return processed_disclosures
 
     async def _process_new_disclosure(
         self,
@@ -104,71 +134,95 @@ class DisclosureMonitor:
             disclosure["report_name"],
         )
 
-        if not self.service.is_treasury_stock_disclosure(disclosure):
+        if not self.service.is_target_disclosure(disclosure):
             logger.info(
-                "Disclosure ignored by treasury stock filter | rcpNo=%s",
+                "Disclosure ignored by target report filter | rcpNo=%s",
                 disclosure["rcp_no"],
             )
             return None
 
-        detail_page = None
+        await self.notification_publisher.publish(
+            self._build_target_disclosure_event(disclosure)
+        )
 
-        try:
-            detail_page = await self.browser.open_disclosure_detail(
-                disclosure["rcp_no"]
-            )
+        trading_result = await self.trading_service.try_auto_buy(disclosure)
 
-            detail = await parse_disclosure_detail(
-                detail_page,
-                report_name=disclosure["report_name"],
-                stock_name=disclosure["stock_name"],
-            )
-
-            logger.info(
-                "Disclosure detail parsed | detail=%s",
-                detail,
-            )
-
+        if trading_result.attempted or self.trading_service.auto_buy_enabled:
             await self.notification_publisher.publish(
-                self._build_treasury_stock_event(detail)
+                self._build_trading_event(trading_result)
             )
 
-            return detail
+        return disclosure
 
-        finally:
-            if detail_page:
-                await detail_page.close()
-
-    def _build_treasury_stock_event(self, detail: dict) -> NotificationEvent:
-        report_name = detail.get("report_name", "")
-        stock_name = detail.get("stock_name", "")
-        rcp_no = detail.get("rcp_no", "")
+    def _build_target_disclosure_event(self, disclosure: dict) -> NotificationEvent:
+        report_name = disclosure.get("report_name", "")
+        stock_name = disclosure.get("stock_name", "")
+        stock_code = disclosure.get("stock_code", "")
+        rcept_dt = disclosure.get("rcept_dt", "")
+        rcp_no = disclosure.get("rcp_no", "")
         url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no}"
-
-        amount = (
-            detail.get("acquisition_expected_amount")
-            or detail.get("contract_amount")
-            or "-"
-        )
-        purpose = (
-            detail.get("acquisition_purpose")
-            or detail.get("contract_purpose")
-            or "-"
-        )
 
         return NotificationEvent(
             service="disclosure",
-            event_type="treasury_stock_disclosure.created",
-            title=f"[신규 자사주 공시] {stock_name}",
+            event_type="target_disclosure.created",
+            title=f"[신규 관심 공시] {stock_name}",
             body=(
                 f"보고서: {report_name}\n"
-                f"금액: {amount}\n"
-                f"목적: {purpose}\n"
+                f"종목코드: {stock_code or '-'}\n"
+                f"접수일: {rcept_dt or '-'}\n"
                 f"접수번호: {rcp_no}"
             ),
             url=url,
         )
 
+    def _build_trading_event(self, result: TradingResult) -> NotificationEvent:
+        status_label = {
+            "ordered": "주문접수",
+            "dry_run": "dry-run",
+            "rejected": "거부",
+            "skipped": "스킵",
+        }.get(result.status, result.status)
+        title = f"[자동매수 {status_label}] {result.stock_name or result.stock_code}"
+        body = (
+            f"종목코드: {result.stock_code or '-'}\n"
+            f"접수번호: {result.rcp_no or '-'}\n"
+            f"주문번호: {result.order_no or '-'}\n"
+            f"사유: {result.reason}\n"
+            f"주문금액: {result.order_amount:,}원\n"
+            f"수량: {result.quantity}\n"
+            f"가격: {result.price:,}원"
+        )
+
+        return NotificationEvent(
+            service="trading",
+            event_type=f"auto_buy.{result.status}",
+            title=title,
+            body=body,
+        )
+
+    async def _publish_fill_event(self, event: FillEvent) -> None:
+        await self.notification_publisher.publish(
+            NotificationEvent(
+                service="trading",
+                event_type="auto_buy.filled",
+                title=f"[자동매수 체결] {event.stock_name or event.stock_code}",
+                body=(
+                    f"종목코드: {event.stock_code or '-'}\n"
+                    f"주문번호: {event.order_no or '-'}\n"
+                    f"체결수량: {event.filled_quantity}\n"
+                    f"체결가: {event.filled_price:,}원\n"
+                    f"체결금액: {event.filled_amount:,}원"
+                ),
+            )
+        )
+
+    async def _publish_failure_alert(self, key: str, title: str, body: str) -> None:
+        await self.alert_manager.publish_failure(
+            key=key,
+            title=title,
+            body=body,
+        )
+
     async def stop(self):
         self.running = False
-        await self.browser.stop()
+        await self.trading_service.stop_fill_stream()

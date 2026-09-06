@@ -14,10 +14,14 @@ venv/
 
 # Local runtime data
 data/browser/
-*.log
+data/trading/
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# log
+*.log
+log/
