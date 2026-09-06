@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -98,6 +98,26 @@ class DisclosureService:
 
         current_time = now.time()
         return self.polling_start <= current_time <= self.polling_end
+
+    def seconds_until_polling_time(self, now: datetime | None = None) -> int:
+        now = now or datetime.now()
+
+        if self.is_polling_time(now):
+            return 0
+
+        for day_offset in range(8):
+            candidate_date = now.date() + timedelta(days=day_offset)
+            candidate_start = datetime.combine(candidate_date, self.polling_start)
+
+            if candidate_start <= now:
+                continue
+
+            if self.polling_weekdays_only and candidate_start.weekday() >= 5:
+                continue
+
+            return max(1, int((candidate_start - now).total_seconds()))
+
+        return 60
 
     async def find_new_disclosures(self):
         disclosures = await self.get_recent_reports()

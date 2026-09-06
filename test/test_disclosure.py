@@ -14,6 +14,14 @@ class DisclosureServiceTest(unittest.TestCase):
         self.assertTrue(service.is_polling_time(datetime(2026, 9, 4, 15, 30)))
         self.assertFalse(service.is_polling_time(datetime(2026, 9, 4, 15, 31)))
 
+    def test_seconds_until_polling_time_wakes_at_window_start(self):
+        service = DisclosureService()
+
+        self.assertEqual(
+            service.seconds_until_polling_time(datetime(2026, 9, 4, 8, 59, 30)),
+            30,
+        )
+
 
 async def main():
     print("query_date:", date.today().strftime("%Y%m%d"))

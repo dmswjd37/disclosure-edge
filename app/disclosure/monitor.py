@@ -16,6 +16,7 @@ from app.trading.service import TradingResult
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECONDS = 3
+OUT_OF_HOURS_MAX_SLEEP_SECONDS = 60
 
 
 class DisclosureMonitor:
@@ -63,7 +64,23 @@ class DisclosureMonitor:
 
         logger.info("DART disclosure monitoring started")
 
+        out_of_hours_logged = False
+
         while self.running:
+            if not self.service.is_polling_time():
+                if not out_of_hours_logged:
+                    logger.info("DART polling paused outside configured polling time")
+                    out_of_hours_logged = True
+
+                await asyncio.sleep(
+                    min(
+                        OUT_OF_HOURS_MAX_SLEEP_SECONDS,
+                        self.service.seconds_until_polling_time(),
+                    )
+                )
+                continue
+
+            out_of_hours_logged = False
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
             try:
@@ -81,7 +98,7 @@ class DisclosureMonitor:
 
     async def _poll_once(self):
         if not self.service.is_polling_time():
-            logger.info("DART polling skipped outside configured polling time")
+            logger.debug("DART polling skipped outside configured polling time")
             return []
 
         new_disclosures = await self.service.find_new_disclosures()
