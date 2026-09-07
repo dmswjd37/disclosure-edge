@@ -25,6 +25,9 @@ class NamuClient:
     async def ensure_authenticated(self) -> None:
         await asyncio.to_thread(self._ensure_authenticated_sync)
 
+    async def get_websocket_token(self) -> str:
+        return await asyncio.to_thread(self._get_websocket_token_sync)
+
     async def get_holdings(self) -> list[dict]:
         return await asyncio.to_thread(self._get_holdings_sync)
 
@@ -44,6 +47,14 @@ class NamuClient:
 
     def _ensure_authenticated_sync(self) -> None:
         self._call("/n2/acctinfo", {})
+
+    def _get_websocket_token_sync(self) -> str:
+        try:
+            from nhplug import get_token
+        except ImportError as exc:
+            raise RuntimeError('Install the official SDK first: pip install "nhplug[tls]"') from exc
+
+        return get_token()
 
     def _get_holdings_sync(self) -> list[dict]:
         data = self._balance()

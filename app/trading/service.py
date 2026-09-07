@@ -75,7 +75,7 @@ class TradingService:
         if self.fill_stream is None:
             self.fill_stream = NamuFillWebSocketClient(
                 uri=socket_url,
-                auth_provider=self.client.ensure_authenticated,
+                token_provider=self.client.get_websocket_token,
                 on_fill=self.handle_fill_event,
                 on_failure=self.failure_handler,
             )

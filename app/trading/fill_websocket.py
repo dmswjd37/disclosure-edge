@@ -1,14 +1,24 @@
 import asyncio
+import json
 import logging
+import os
+import ssl
 from dataclasses import dataclass
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
 
 logger = logging.getLogger(__name__)
 
-AuthProvider = Callable[[], Awaitable[None]]
+TokenProvider = Callable[[], Awaitable[str]]
 FillHandler = Callable[["FillEvent"], Awaitable[None]]
 FailureHandler = Callable[[str, str, str], Awaitable[None]]
+
+WS_ACK_OK = "00000"
+WS_PATH = "/websocket"
+PORT_DOMESTIC = "7070"
+PORT_MOCK = "17070"
+NOTICE_TR_CD = "d2"
 
 
 @dataclass(frozen=True)
@@ -26,16 +36,15 @@ class NamuFillWebSocketClient:
     def __init__(
         self,
         uri: str | None,
-        auth_provider: AuthProvider,
+        token_provider: TokenProvider,
         on_fill: FillHandler,
         on_failure: FailureHandler | None = None,
-        timeout_seconds: int = 30,
     ):
         self.uri = uri
-        self.auth_provider = auth_provider
+        self.token_provider = token_provider
         self.on_fill = on_fill
         self.on_failure = on_failure
-        self.timeout_seconds = timeout_seconds
+        self.websocket = None
         self.keep_running = False
         self.task: asyncio.Task | None = None
 
@@ -48,6 +57,10 @@ class NamuFillWebSocketClient:
 
     async def stop(self) -> None:
         self.keep_running = False
+
+        if self.websocket:
+            await self._unregister()
+            await self.websocket.close()
 
         if self.task:
             self.task.cancel()
@@ -71,43 +84,84 @@ class NamuFillWebSocketClient:
                 if self.on_failure:
                     await self.on_failure(
                         "namu.fill_websocket",
-                        "[장애] 나무 체결 WebSocket 실패",
+                        "[failure] Namu fill WebSocket failed",
                         f"{type(exc).__name__}: {exc}",
                     )
 
-                await asyncio.sleep(3)
+                if self.keep_running:
+                    await asyncio.sleep(3)
 
     async def _run_once(self) -> None:
         try:
-            from nhplug.realtime import subscribe
+            import websockets
         except ImportError as exc:
-            raise RuntimeError('Install the official SDK first: pip install "nhplug[tls]"') from exc
+            raise RuntimeError("Install websockets to use Namu fill streaming") from exc
 
-        await self.auth_provider()
-        loop = asyncio.get_running_loop()
-        pending: set[asyncio.Future] = set()
+        token = await self.token_provider()
+        url = self.uri or _default_websocket_url()
 
-        def on_message(message: dict) -> None:
-            logger.info("Namu fill websocket message: %s", message)
+        async with websockets.connect(
+            url,
+            ssl=_ssl_context(),
+            ping_interval=None,
+        ) as websocket:
+            self.websocket = websocket
+            logger.info("Namu fill websocket connected | url=%s", url)
 
-            for fill_event in extract_fill_events(message):
-                future = asyncio.run_coroutine_threadsafe(self.on_fill(fill_event), loop)
-                pending.add(future)
-                future.add_done_callback(pending.discard)
+            await self._register(token)
 
-        await asyncio.to_thread(
-            subscribe,
-            [],
-            on_message,
-            tr_cd="d2",
-            timeout=self.timeout_seconds,
-            url=self.uri,
+            async for message in websocket:
+                response = _parse_message(message)
+
+                if not response:
+                    continue
+
+                if _is_ack(response):
+                    _raise_for_ack(response)
+                    logger.info("Namu fill websocket subscription acknowledged")
+                    continue
+
+                logger.info("Namu fill websocket message: %s", response)
+
+                for fill_event in extract_fill_events(response):
+                    await self.on_fill(fill_event)
+
+                if not self.keep_running:
+                    break
+
+    async def _register(self, token: str) -> None:
+        await self._send(
+            {
+                "header": {
+                    "token": token,
+                    "tr_type": "1",
+                },
+                "body": {
+                    "tr_cd": NOTICE_TR_CD,
+                    "tr_key": "",
+                },
+            }
         )
 
-        if pending:
-            await asyncio.gather(*[asyncio.wrap_future(future) for future in pending])
+    async def _unregister(self) -> None:
+        await self._send(
+            {
+                "header": {
+                    "token": await self.token_provider(),
+                    "tr_type": "2",
+                },
+                "body": {
+                    "tr_cd": NOTICE_TR_CD,
+                    "tr_key": "",
+                },
+            }
+        )
 
-        logger.info("Namu order fill realtime subscription ended")
+    async def _send(self, message: dict) -> None:
+        if not self.websocket:
+            return
+
+        await self.websocket.send(json.dumps(message))
 
 
 def extract_fill_events(response: dict) -> list[FillEvent]:
@@ -143,6 +197,57 @@ def extract_fill_events(response: dict) -> list[FillEvent]:
         )
 
     return events
+
+
+def _default_websocket_url() -> str:
+    try:
+        from nhplug import get_base_url
+    except ImportError as exc:
+        raise RuntimeError('Install the official SDK first: pip install "nhplug[tls]"') from exc
+
+    explicit = os.getenv("NHPLUG_WS_URL")
+
+    if explicit:
+        url = explicit.strip().rstrip("/")
+        return url if urlsplit(url).path else f"{url}{WS_PATH}"
+
+    host = get_base_url().split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    port = PORT_MOCK if host.startswith("moapi") else PORT_DOMESTIC
+    return f"wss://{host}:{port}{WS_PATH}"
+
+
+def _ssl_context() -> ssl.SSLContext | None:
+    try:
+        import truststore
+    except ImportError:
+        return None
+
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def _parse_message(message) -> dict:
+    if isinstance(message, bytes):
+        message = message.decode("utf-8")
+
+    try:
+        data = json.loads(message)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _is_ack(message: dict) -> bool:
+    header = message.get("header")
+    return isinstance(header, dict) and ("tr_type" in header or "rsp_cd" in header)
+
+
+def _raise_for_ack(message: dict) -> None:
+    header = message.get("header") or {}
+    code = str(header.get("rsp_cd") or "")
+
+    if code and code != WS_ACK_OK:
+        raise RuntimeError(f"Namu websocket subscribe failed: {code} {header.get('rsp_msg') or ''}")
 
 
 def _iter_payload_rows(value) -> list[dict]:

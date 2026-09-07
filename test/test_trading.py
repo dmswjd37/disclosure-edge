@@ -14,6 +14,9 @@ class FakeNamuClient:
     async def ensure_authenticated(self) -> None:
         pass
 
+    async def get_websocket_token(self) -> str:
+        return "token"
+
     async def get_holdings(self) -> list[dict]:
         return []
 
