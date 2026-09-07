@@ -147,7 +147,7 @@ class TelegramCommandMonitor:
                         f"자동매수: {'켜짐' if status['auto_buy_enabled'] else '꺼짐'}\n"
                         f"dry-run: {'켜짐' if status['dry_run'] else '꺼짐'}\n"
                         f"계좌구분: {status['account_type']}\n"
-                        f"키움설정: {'완료' if status['kiwoom_configured'] else '미완료'}\n"
+                        f"나무설정: {'완료' if status['namu_configured'] else '미완료'}\n"
                         f"체결수신: {'실행중' if status['fill_stream_running'] else '중지'}"
                     ),
                 )

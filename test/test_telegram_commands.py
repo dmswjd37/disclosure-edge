@@ -18,7 +18,7 @@ class FakeTradingService:
             "auto_buy_enabled": self.auto_buy_enabled,
             "dry_run": self.dry_run,
             "account_type": "paper",
-            "kiwoom_configured": True,
+            "namu_configured": True,
             "fill_stream_running": False,
         }
 

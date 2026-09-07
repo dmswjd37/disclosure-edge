@@ -66,6 +66,32 @@ class KiwoomSettings:
 
 
 @dataclass(frozen=True)
+class NamuSettings:
+    auto_buy_enabled: bool
+    dry_run: bool
+    is_paper_trading: bool
+    app_key: str | None
+    app_secret: str | None
+    base_url: str | None
+    auth_url: str | None
+    account_no: str | None
+    market_cd: str
+    ws_url: str | None
+
+    @property
+    def account_type(self) -> str:
+        return "paper" if self.is_paper_trading else "real"
+
+    @property
+    def socket_url(self) -> str | None:
+        return self.ws_url
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.app_key and self.app_secret and self.base_url and self.auth_url)
+
+
+@dataclass(frozen=True)
 class TradingRiskSettings:
     order_budget: int
     min_cash_balance: int
@@ -76,11 +102,12 @@ class TradingRiskSettings:
 @dataclass(frozen=True)
 class TradingSettings:
     kiwoom: KiwoomSettings
+    namu: NamuSettings
     risk: TradingRiskSettings
 
 
 def get_trading_settings() -> TradingSettings:
-    order_budget = _env_int("KIWOOM_ORDER_BUDGET", 4_000_000)
+    order_budget = _env_int("NHPLUG_ORDER_BUDGET", _env_int("KIWOOM_ORDER_BUDGET", 4_000_000))
 
     return TradingSettings(
         kiwoom=KiwoomSettings(
@@ -102,10 +129,42 @@ def get_trading_settings() -> TradingSettings:
                 "wss://mockapi.kiwoom.com:10000/api/dostk/websocket",
             ),
         ),
+        namu=NamuSettings(
+            auto_buy_enabled=_env_flag(
+                "NHPLUG_AUTO_BUY_ENABLED",
+                default=_env_flag("KIWOOM_AUTO_BUY_ENABLED", default=False),
+            ),
+            dry_run=_env_flag(
+                "NHPLUG_DRY_RUN",
+                default=_env_flag("KIWOOM_DRY_RUN", default=True),
+            ),
+            is_paper_trading=_env_flag(
+                "NHPLUG_IS_PAPER_TRADING",
+                default=_env_flag("KIWOOM_IS_PAPER_TRADING", default=True),
+            ),
+            app_key=os.getenv("NHPLUG_APP_KEY"),
+            app_secret=os.getenv("NHPLUG_APP_SECRET"),
+            base_url=os.getenv("NHPLUG_BASE_URL"),
+            auth_url=os.getenv("NHPLUG_AUTH_URL"),
+            account_no=os.getenv("NHPLUG_DEFAULT_ACCOUNT"),
+            market_cd=os.getenv("NHPLUG_MARKET_CD", "UNT"),
+            ws_url=os.getenv("NHPLUG_WS_URL"),
+        ),
         risk=TradingRiskSettings(
             order_budget=order_budget,
-            min_cash_balance=_env_int("KIWOOM_MIN_CASH_BALANCE", 5_000_000),
-            daily_max_buy_amount=_env_int("KIWOOM_DAILY_MAX_BUY_AMOUNT", order_budget),
-            state_path=Path(os.getenv("KIWOOM_ORDER_STATE_PATH", "data/trading/orders.json")),
+            min_cash_balance=_env_int(
+                "NHPLUG_MIN_CASH_BALANCE",
+                _env_int("KIWOOM_MIN_CASH_BALANCE", 5_000_000),
+            ),
+            daily_max_buy_amount=_env_int(
+                "NHPLUG_DAILY_MAX_BUY_AMOUNT",
+                _env_int("KIWOOM_DAILY_MAX_BUY_AMOUNT", order_budget),
+            ),
+            state_path=Path(
+                os.getenv(
+                    "NHPLUG_ORDER_STATE_PATH",
+                    os.getenv("KIWOOM_ORDER_STATE_PATH", "data/trading/orders.json"),
+                )
+            ),
         ),
     )

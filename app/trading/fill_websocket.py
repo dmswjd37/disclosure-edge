@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -7,7 +6,7 @@ from typing import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
-TokenProvider = Callable[[], Awaitable[str]]
+AuthProvider = Callable[[], Awaitable[None]]
 FillHandler = Callable[["FillEvent"], Awaitable[None]]
 FailureHandler = Callable[[str, str, str], Awaitable[None]]
 
@@ -23,19 +22,20 @@ class FillEvent:
     raw: dict
 
 
-class KiwoomFillWebSocketClient:
+class NamuFillWebSocketClient:
     def __init__(
         self,
-        uri: str,
-        token_provider: TokenProvider,
+        uri: str | None,
+        auth_provider: AuthProvider,
         on_fill: FillHandler,
         on_failure: FailureHandler | None = None,
+        timeout_seconds: int = 30,
     ):
         self.uri = uri
-        self.token_provider = token_provider
+        self.auth_provider = auth_provider
         self.on_fill = on_fill
         self.on_failure = on_failure
-        self.websocket = None
+        self.timeout_seconds = timeout_seconds
         self.keep_running = False
         self.task: asyncio.Task | None = None
 
@@ -44,13 +44,10 @@ class KiwoomFillWebSocketClient:
             return
 
         self.keep_running = True
-        self.task = asyncio.create_task(self.run(), name="kiwoom-fill-websocket")
+        self.task = asyncio.create_task(self.run(), name="namu-fill-websocket")
 
     async def stop(self) -> None:
         self.keep_running = False
-
-        if self.websocket:
-            await self.websocket.close()
 
         if self.task:
             self.task.cancel()
@@ -69,103 +66,68 @@ class KiwoomFillWebSocketClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("Kiwoom fill websocket failed")
+                logger.exception("Namu fill websocket failed")
+
                 if self.on_failure:
                     await self.on_failure(
-                        "kiwoom.fill_websocket",
-                        "[장애] 키움 체결 WebSocket 실패",
+                        "namu.fill_websocket",
+                        "[장애] 나무 체결 WebSocket 실패",
                         f"{type(exc).__name__}: {exc}",
                     )
+
                 await asyncio.sleep(3)
 
     async def _run_once(self) -> None:
         try:
-            import websockets
+            from nhplug.realtime import subscribe
         except ImportError as exc:
-            raise RuntimeError("Install the websockets package to use fill streaming") from exc
+            raise RuntimeError('Install the official SDK first: pip install "nhplug[tls]"') from exc
 
-        token = await self.token_provider()
+        await self.auth_provider()
+        loop = asyncio.get_running_loop()
+        pending: set[asyncio.Future] = set()
 
-        async with websockets.connect(self.uri) as websocket:
-            self.websocket = websocket
-            logger.info("Kiwoom fill websocket connected")
+        def on_message(message: dict) -> None:
+            logger.info("Namu fill websocket message: %s", message)
 
-            await self._send(
-                {
-                    "trnm": "LOGIN",
-                    "token": token,
-                }
-            )
+            for fill_event in extract_fill_events(message):
+                future = asyncio.run_coroutine_threadsafe(self.on_fill(fill_event), loop)
+                pending.add(future)
+                future.add_done_callback(pending.discard)
 
-            async for message in websocket:
-                response = json.loads(message)
-                trnm = response.get("trnm")
-
-                if trnm == "LOGIN":
-                    if response.get("return_code") != 0:
-                        raise RuntimeError(
-                            f"Kiwoom websocket login failed: {response.get('return_msg')}"
-                        )
-
-                    logger.info("Kiwoom fill websocket login succeeded")
-                    await self._register_order_fill()
-                    continue
-
-                if trnm == "PING":
-                    await self._send(response)
-                    continue
-
-                logger.info("Kiwoom fill websocket message: %s", response)
-
-                for fill_event in extract_fill_events(response):
-                    await self.on_fill(fill_event)
-
-    async def _send(self, message: dict) -> None:
-        await self.websocket.send(json.dumps(message))
-
-    async def _register_order_fill(self) -> None:
-        await self._send(
-            {
-                "trnm": "REG",
-                "grp_no": "1",
-                "refresh": "1",
-                "data": [
-                    {
-                        "item": [""],
-                        "type": ["00"],
-                    }
-                ],
-            }
+        await asyncio.to_thread(
+            subscribe,
+            [],
+            on_message,
+            tr_cd="d2",
+            timeout=self.timeout_seconds,
+            url=self.uri,
         )
-        logger.info("Kiwoom order fill realtime registered")
+
+        if pending:
+            await asyncio.gather(*[asyncio.wrap_future(future) for future in pending])
+
+        logger.info("Namu order fill realtime subscription ended")
 
 
 def extract_fill_events(response: dict) -> list[FillEvent]:
     events = []
 
     for row in _iter_payload_rows(response):
-        order_status = _first_text(row, "913", "주문상태")
-        side = _first_text(row, "907", "매도수구분")
-        order_type = _first_text(row, "905", "주문구분")
-
-        if "체결" not in order_status:
-            continue
+        side = _first_text(row, "slbygb", "907", "매도매수구분")
 
         if side and side != "2":
             continue
 
-        if order_type and "매수" not in order_type:
-            continue
-
-        order_no = _first_text(row, "9203", "ord_no", "ordno", "주문번호")
-        filled_quantity = _first_int(row, "911", "915", "cntr_qty", "체결량", "체결수량")
-        filled_price = _first_int(row, "910", "914", "cntr_pric", "cntr_uv", "체결가", "체결단가")
+        order_no = _first_text(row, "orderno", "9203", "ord_no", "ordno", "주문번호")
+        filled_quantity = _first_int(row, "concgty", "911", "915", "cntr_qty", "체결수량")
+        filled_price = _first_int(row, "concprc", "910", "914", "cntr_pric", "cntr_uv", "체결가")
 
         if not order_no or filled_quantity <= 0 or filled_price <= 0:
             continue
 
-        stock_code = _first_text(row, "9001", "stk_cd", "종목코드").replace("A", "")
-        stock_name = _first_text(row, "302", "stk_nm", "종목명")
+        stock_code = _first_text(row, "issuecd", "9001", "stk_cd", "종목코드").replace("A", "")
+        stock_name = _first_text(row, "issue_nm", "302", "stk_nm", "종목명")
         filled_amount = filled_quantity * filled_price
 
         events.append(
@@ -187,13 +149,16 @@ def _iter_payload_rows(value) -> list[dict]:
     if isinstance(value, dict):
         rows = []
 
+        if "body" in value:
+            rows.extend(_iter_payload_rows(value["body"]))
+
         if "data" in value:
             rows.extend(_iter_payload_rows(value["data"]))
 
         if "values" in value:
             rows.extend(_iter_payload_rows(value["values"]))
 
-        if any(key in value for key in ("9203", "ord_no", "ordno", "주문번호")):
+        if any(key in value for key in ("orderno", "9203", "ord_no", "ordno", "주문번호")):
             rows.append(value)
 
         return rows

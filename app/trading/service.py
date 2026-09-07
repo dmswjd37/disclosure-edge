@@ -4,8 +4,8 @@ from datetime import date
 from typing import Awaitable, Callable
 
 from app.trading.config import TradingSettings, get_trading_settings
-from app.trading.fill_websocket import FillEvent, KiwoomFillWebSocketClient
-from app.trading.kiwoom_client import KiwoomClient
+from app.trading.fill_websocket import FillEvent, NamuFillWebSocketClient
+from app.trading.namu_client import NamuClient
 from app.trading.order_repository import OrderRepository, new_order_record
 
 
@@ -34,18 +34,18 @@ class TradingService:
     def __init__(
         self,
         settings: TradingSettings | None = None,
-        client: KiwoomClient | None = None,
+        client: NamuClient | None = None,
         repository: OrderRepository | None = None,
         fill_handler: Callable[[FillEvent], Awaitable[None]] | None = None,
         failure_handler: Callable[[str, str, str], Awaitable[None]] | None = None,
     ):
         self.settings = settings or get_trading_settings()
-        self.client = client or KiwoomClient(self.settings.kiwoom)
+        self.client = client or NamuClient(self.settings.namu)
         self.repository = repository or OrderRepository(self.settings.risk.state_path)
         self.fill_handler = fill_handler
         self.failure_handler = failure_handler
-        self.fill_stream: KiwoomFillWebSocketClient | None = None
-        self._auto_buy_enabled = self.settings.kiwoom.auto_buy_enabled
+        self.fill_stream: NamuFillWebSocketClient | None = None
+        self._auto_buy_enabled = self.settings.namu.auto_buy_enabled
 
     @property
     def auto_buy_enabled(self) -> bool:
@@ -53,7 +53,7 @@ class TradingService:
 
     @property
     def dry_run(self) -> bool:
-        return self.settings.kiwoom.dry_run
+        return self.settings.namu.dry_run
 
     async def set_auto_buy_enabled(self, enabled: bool) -> None:
         self._auto_buy_enabled = enabled
@@ -70,16 +70,12 @@ class TradingService:
         if self.dry_run or not self.auto_buy_enabled:
             return
 
-        socket_url = self.settings.kiwoom.socket_url
-
-        if not socket_url:
-            logger.warning("Kiwoom fill websocket URL is not configured")
-            return
+        socket_url = self.settings.namu.socket_url
 
         if self.fill_stream is None:
-            self.fill_stream = KiwoomFillWebSocketClient(
+            self.fill_stream = NamuFillWebSocketClient(
                 uri=socket_url,
-                token_provider=self.client.get_access_token,
+                auth_provider=self.client.ensure_authenticated,
                 on_fill=self.handle_fill_event,
                 on_failure=self.failure_handler,
             )
@@ -115,22 +111,22 @@ class TradingService:
         if daily_remaining <= 0:
             return self._skip(disclosure, "daily buy limit reached")
 
-        if not self.settings.kiwoom.configured:
-            return self._skip(disclosure, "kiwoom credentials are not configured")
+        if not self.settings.namu.configured:
+            return self._skip(disclosure, "namu credentials are not configured")
 
-        token = await self.client.get_access_token()
-        holdings = await self.client.get_holdings(token)
+        await self.client.ensure_authenticated()
+        holdings = await self.client.get_holdings()
 
         if _has_holding(holdings, stock_code):
             return self._skip(disclosure, "stock is already held")
 
-        cash_balance = await self.client.get_cash_balance(token)
+        cash_balance = await self.client.get_cash_balance()
 
         if cash_balance < self.settings.risk.min_cash_balance:
             return self._skip(disclosure, "cash balance is below minimum")
 
         # 최우선 매도호가
-        price = await self.client.get_best_ask_price(stock_code, token)
+        price = await self.client.get_best_ask_price(stock_code)
 
         if price <= 0:
             return self._skip(disclosure, "best ask price is invalid")
@@ -179,7 +175,7 @@ class TradingService:
                 price=price,
             )
 
-        submission = await self.client.buy_stock(stock_code, quantity, price, token)
+        submission = await self.client.buy_stock(stock_code, quantity, price)
 
         if submission.return_code != 0:
             logger.warning(
@@ -192,7 +188,7 @@ class TradingService:
                 attempted=True,
                 ordered=False,
                 status="rejected",
-                reason=f"kiwoom return_code={submission.return_code}",
+                reason=f"namu return_code={submission.return_code}",
                 stock_code=stock_code,
                 stock_name=stock_name,
                 rcp_no=rcp_no,
@@ -256,8 +252,8 @@ class TradingService:
         return {
             "auto_buy_enabled": self.auto_buy_enabled,
             "dry_run": self.dry_run,
-            "account_type": self.settings.kiwoom.account_type,
-            "kiwoom_configured": self.settings.kiwoom.configured,
+            "account_type": self.settings.namu.account_type,
+            "namu_configured": self.settings.namu.configured,
             "fill_stream_running": bool(
                 self.fill_stream
                 and self.fill_stream.task
