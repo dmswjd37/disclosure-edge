@@ -103,7 +103,8 @@ class NamuFillWebSocketClient:
         async with websockets.connect(
             url,
             ssl=_ssl_context(),
-            ping_interval=None,
+            ping_interval=60,
+            ping_timeout=20,
         ) as websocket:
             self.websocket = websocket
             logger.info("Namu fill websocket connected | url=%s", url)
