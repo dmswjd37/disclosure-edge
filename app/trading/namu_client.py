@@ -15,6 +15,12 @@ class OrderSubmission:
     order_no: str
 
 
+@dataclass(frozen=True)
+class AccountSnapshot:
+    holdings: list[dict]
+    cash_balance: int
+
+
 class NamuClient:
     """NH투자증권 Namuh PLUG SDK adapter for the trading service."""
 
@@ -28,11 +34,17 @@ class NamuClient:
     async def get_websocket_token(self) -> str:
         return await asyncio.to_thread(self._get_websocket_token_sync)
 
+    # 보유 종목만 필요할 때 사용합니다. 현금도 필요하면 get_account_snapshot을 우선 사용하세요.
     async def get_holdings(self) -> list[dict]:
         return await asyncio.to_thread(self._get_holdings_sync)
 
+    # 주문 가능 현금만 필요할 때 사용합니다. 보유 종목도 필요하면 get_account_snapshot을 우선 사용하세요.
     async def get_cash_balance(self) -> int:
         return await asyncio.to_thread(self._get_cash_balance_sync)
+
+    # 잔고를 한 번만 조회해 자동매수 판단에 필요한 보유 종목과 현금을 함께 추출합니다.
+    async def get_account_snapshot(self) -> AccountSnapshot:
+        return await asyncio.to_thread(self._get_account_snapshot_sync)
 
     async def get_best_ask_price(self, stock_code: str) -> int:
         return await asyncio.to_thread(self._get_best_ask_price_sync, stock_code)
@@ -58,6 +70,20 @@ class NamuClient:
 
     def _get_holdings_sync(self) -> list[dict]:
         data = self._balance()
+        return self._extract_holdings(data)
+
+    def _get_cash_balance_sync(self) -> int:
+        data = self._balance()
+        return self._extract_cash_balance(data)
+
+    def _get_account_snapshot_sync(self) -> AccountSnapshot:
+        data = self._balance()
+        return AccountSnapshot(
+            holdings=self._extract_holdings(data),
+            cash_balance=self._extract_cash_balance(data),
+        )
+
+    def _extract_holdings(self, data: dict) -> list[dict]:
         holdings = data.get("Output_1") or []
 
         for holding in holdings:
@@ -66,8 +92,7 @@ class NamuClient:
 
         return holdings
 
-    def _get_cash_balance_sync(self) -> int:
-        data = self._balance()
+    def _extract_cash_balance(self, data: dict) -> int:
         summary = data.get("Output_0") or {}
 
         return _first_int(

@@ -5,12 +5,15 @@ from pathlib import Path
 
 from app.trading.config import KiwoomSettings, NamuSettings, TradingRiskSettings, TradingSettings
 from app.trading.fill_websocket import extract_fill_events
-from app.trading.namu_client import OrderSubmission
+from app.trading.namu_client import AccountSnapshot, OrderSubmission
 from app.trading.order_repository import OrderRepository
 from app.trading.service import TradingService
 
 
 class FakeNamuClient:
+    def __init__(self):
+        self.account_snapshot_calls = 0
+
     async def ensure_authenticated(self) -> None:
         pass
 
@@ -22,6 +25,10 @@ class FakeNamuClient:
 
     async def get_cash_balance(self) -> int:
         return 10_000_000
+
+    async def get_account_snapshot(self) -> AccountSnapshot:
+        self.account_snapshot_calls += 1
+        return AccountSnapshot(holdings=[], cash_balance=10_000_000)
 
     async def get_best_ask_price(self, stock_code: str) -> int:
         return 10_000
@@ -89,6 +96,30 @@ class TradingServiceTest(unittest.TestCase):
             self.assertEqual(first.quantity, 400)
             self.assertEqual(second.status, "skipped")
             self.assertEqual(second.reason, "receipt already ordered")
+
+    def test_auto_buy_uses_single_balance_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = OrderRepository(Path(temp_dir) / "orders.json")
+            client = FakeNamuClient()
+            service = TradingService(
+                settings=make_settings(repository.path),
+                client=client,
+                repository=repository,
+            )
+
+            result = asyncio.run(
+                service.try_auto_buy(
+                    {
+                        "rcp_no": "20260904000048",
+                        "stock_code": "049430",
+                        "stock_name": "sample",
+                        "report_name": "report",
+                    }
+                )
+            )
+
+            self.assertEqual(result.status, "dry_run")
+            self.assertEqual(client.account_snapshot_calls, 1)
 
     def test_disabled_auto_buy_skips_before_broker_call(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from app.trading.config import TradingSettings, get_trading_settings
 from app.trading.fill_websocket import FillEvent, NamuFillWebSocketClient
-from app.trading.namu_client import NamuClient
+from app.trading.namu_client import AccountSnapshot, NamuClient
 from app.trading.order_repository import OrderRepository, new_order_record
 
 
@@ -115,12 +115,14 @@ class TradingService:
             return self._skip(disclosure, "namu credentials are not configured")
 
         await self.client.ensure_authenticated()
-        holdings = await self.client.get_holdings()
+        # 보유종목과 잔고 확인
+        account = await self.client.get_account_snapshot()
+        holdings = account.holdings
 
         if _has_holding(holdings, stock_code):
             return self._skip(disclosure, "stock is already held")
 
-        cash_balance = await self.client.get_cash_balance()
+        cash_balance = account.cash_balance
 
         if cash_balance < self.settings.risk.min_cash_balance:
             return self._skip(disclosure, "cash balance is below minimum")
