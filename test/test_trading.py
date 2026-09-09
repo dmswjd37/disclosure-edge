@@ -1,11 +1,14 @@
 import asyncio
+import os
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 from app.trading.config import KiwoomSettings, NamuSettings, TradingRiskSettings, TradingSettings
 from app.trading.fill_websocket import extract_fill_events
-from app.trading.namu_client import AccountSnapshot, OrderSubmission
+from app.trading.namu_client import AccountSnapshot, NamuClient, OrderSubmission
 from app.trading.order_repository import OrderRepository
 from app.trading.service import TradingService
 
@@ -60,6 +63,7 @@ def make_settings(path: Path, auto_buy_enabled: bool = True) -> TradingSettings:
             app_secret="secret",
             base_url="https://moapi.nhplug.com:8443",
             auth_url="https://api.nhplug.com:8443",
+            quote_base_url=None,
             account_no="12345678901",
             market_cd="UNT",
             ws_url=None,
@@ -120,6 +124,37 @@ class TradingServiceTest(unittest.TestCase):
 
             self.assertEqual(result.status, "dry_run")
             self.assertEqual(client.account_snapshot_calls, 1)
+
+    def test_namu_current_price_uses_quote_base_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = make_settings(Path(temp_dir) / "orders.json").namu
+            client = NamuClient(settings)
+            previous_module = sys.modules.get("nhplug")
+            previous_base_url = os.environ.get("NHPLUG_BASE_URL")
+            seen_base_urls = []
+
+            def fake_call(path: str, payload: dict) -> dict:
+                seen_base_urls.append(os.environ.get("NHPLUG_BASE_URL"))
+                return {"Output_0": {"askp1": "10000"}}
+
+            sys.modules["nhplug"] = types.SimpleNamespace(call=fake_call)
+            os.environ["NHPLUG_BASE_URL"] = "https://moapi.nhplug.com:8443"
+
+            try:
+                price = client._get_best_ask_price_sync("005930")
+            finally:
+                if previous_module is None:
+                    sys.modules.pop("nhplug", None)
+                else:
+                    sys.modules["nhplug"] = previous_module
+
+                if previous_base_url is None:
+                    os.environ.pop("NHPLUG_BASE_URL", None)
+                else:
+                    os.environ["NHPLUG_BASE_URL"] = previous_base_url
+
+            self.assertEqual(price, 10_000)
+            self.assertEqual(seen_base_urls, ["https://api.nhplug.com:8443"])
 
     def test_disabled_auto_buy_skips_before_broker_call(self):
         with tempfile.TemporaryDirectory() as temp_dir:

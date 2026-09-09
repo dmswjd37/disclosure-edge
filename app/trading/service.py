@@ -5,7 +5,7 @@ from typing import Awaitable, Callable
 
 from app.trading.config import TradingSettings, get_trading_settings
 from app.trading.fill_websocket import FillEvent, NamuFillWebSocketClient
-from app.trading.namu_client import AccountSnapshot, NamuClient
+from app.trading.namu_client import NamuClient
 from app.trading.order_repository import OrderRepository, new_order_record
 
 
@@ -177,6 +177,7 @@ class TradingService:
                 price=price,
             )
 
+        # 매수 신청
         submission = await self.client.buy_stock(stock_code, quantity, price)
 
         if submission.return_code != 0:

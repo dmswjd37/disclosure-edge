@@ -1,11 +1,15 @@
 import asyncio
 import logging
 import os
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 
 logger = logging.getLogger(__name__)
+_NHPLUG_CALL_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -46,9 +50,11 @@ class NamuClient:
     async def get_account_snapshot(self) -> AccountSnapshot:
         return await asyncio.to_thread(self._get_account_snapshot_sync)
 
+    # 최우선 매도호가
     async def get_best_ask_price(self, stock_code: str) -> int:
         return await asyncio.to_thread(self._get_best_ask_price_sync, stock_code)
 
+    # 매수 신청
     async def buy_stock(
         self,
         stock_code: str,
@@ -112,6 +118,7 @@ class NamuClient:
                 "iem_cd": _normalize_stock_code(stock_code),
                 "market_cd": self._market_cd,
             },
+            base_url=self._quote_base_url,
         )
         quote = data.get("Output_0") or {}
 
@@ -191,13 +198,15 @@ class NamuClient:
         self._account_no = str(selected).strip()
         return self._account_no
 
-    def _call(self, path: str, payload: dict) -> dict:
+    def _call(self, path: str, payload: dict, base_url: str | None = None) -> dict:
         try:
             from nhplug import call
         except ImportError as exc:
             raise RuntimeError('Install the official SDK first: pip install "nhplug[tls]"') from exc
 
-        data = call(path, payload)
+        with _NHPLUG_CALL_LOCK:
+            with _temporary_nhplug_base_url(base_url):
+                data = call(path, payload)
         logger.info("Namu API response | path=%s", path)
         return data
 
@@ -217,6 +226,34 @@ class NamuClient:
             return os.getenv("NHPLUG_BASE_URL", "")
 
         return get_base_url()
+
+    @property
+    def _quote_base_url(self) -> str:
+        return str(
+            _setting_value(self.settings, "quote_base_url")
+            or _setting_value(self.settings, "auth_url")
+            or os.getenv("NHPLUG_QUOTE_BASE_URL")
+            or os.getenv("NHPLUG_AUTH_URL")
+            or "https://api.nhplug.com:8443"
+        ).strip()
+
+
+@contextmanager
+def _temporary_nhplug_base_url(base_url: str | None) -> Iterator[None]:
+    if not base_url:
+        yield
+        return
+
+    previous = os.environ.get("NHPLUG_BASE_URL")
+    os.environ["NHPLUG_BASE_URL"] = base_url
+
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("NHPLUG_BASE_URL", None)
+        else:
+            os.environ["NHPLUG_BASE_URL"] = previous
 
 
 def _account_matches_base_url(account: dict, base_url: str) -> bool:

@@ -24,4 +24,4 @@ Thumbs.db
 
 # log
 *.log
-log/
+logs/

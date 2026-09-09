@@ -74,6 +74,7 @@ class NamuSettings:
     app_secret: str | None
     base_url: str | None
     auth_url: str | None
+    quote_base_url: str | None
     account_no: str | None
     market_cd: str
     ws_url: str | None
@@ -146,6 +147,7 @@ def get_trading_settings() -> TradingSettings:
             app_secret=os.getenv("NHPLUG_APP_SECRET"),
             base_url=os.getenv("NHPLUG_BASE_URL"),
             auth_url=os.getenv("NHPLUG_AUTH_URL"),
+            quote_base_url=os.getenv("NHPLUG_QUOTE_BASE_URL"),
             account_no=os.getenv("NHPLUG_DEFAULT_ACCOUNT"),
             market_cd=os.getenv("NHPLUG_MARKET_CD", "UNT"),
             ws_url=os.getenv("NHPLUG_WS_URL"),
