@@ -100,16 +100,7 @@ class NamuClient:
 
     def _extract_cash_balance(self, data: dict) -> int:
         summary = data.get("Output_0") or {}
-
-        return _first_int(
-            summary,
-            "orr_pbl_amt",
-            "csh_wtm",
-            "sba_amt",
-            "dca",
-            "nas_amt",
-            "tot_aet_amt",
-        )
+        return _to_int(summary.get("dca"))
 
     def _get_best_ask_price_sync(self, stock_code: str) -> int:
         data = self._call(
