@@ -16,6 +16,9 @@ def configure_logging() -> logging.Logger:
         return logger
 
     logger.setLevel(logging.INFO)
+    # HTTPX request logs contain Telegram's bot token in the URL.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s - %(message)s",

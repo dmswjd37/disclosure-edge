@@ -1,11 +1,9 @@
 import asyncio
-import json
 import logging
 import os
 from typing import Awaitable, Callable
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
+import httpx
 from dotenv import load_dotenv
 
 from app.notification.publisher import NotificationEvent, NotificationPublisher
@@ -17,6 +15,22 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API_BASE_URL = "https://api.telegram.org"
+POLL_TIMEOUT_SECONDS = 10
+FAILURE_ALERT_THRESHOLD = 3
+
+
+class TelegramPollingError(Exception):
+    """API error containing no request URL, token, or raw response body."""
+
+    def __init__(self, code: int, retry_after: float = 0):
+        self.code = code
+        self.retry_after = retry_after
+        hint = {
+            401: "check bot credentials",
+            409: "check duplicate getUpdates consumers or an active webhook",
+            429: "rate limited",
+        }.get(code, "getUpdates rejected")
+        super().__init__(f"Telegram API {code}: {hint}")
 
 
 class TelegramCommandMonitor:
@@ -33,12 +47,15 @@ class TelegramCommandMonitor:
         self.allowed_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.last_update_id = 0
         self.running = False
+        self._stop_event = asyncio.Event()
 
     @property
     def configured(self) -> bool:
         return bool(self.bot_token and self.allowed_chat_id)
 
     async def start(self) -> None:
+        if self.running:
+            return
         if not self.configured:
             logger.warning(
                 "Telegram command monitor is not configured. "
@@ -47,51 +64,105 @@ class TelegramCommandMonitor:
             return
 
         self.running = True
+        self._stop_event.clear()
         logger.info("Telegram command monitor started")
+        try:
+            # Reuse connections; the read timeout must exceed long polling.
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10, read=20, write=10, pool=5),
+            ) as client:
+                await self._poll(client)
+        finally:
+            self.running = False
+            logger.info("Telegram command monitor stopped")
 
+    async def _poll(self, client: httpx.AsyncClient) -> None:
+        failures = 0
         while self.running:
             try:
-                updates = await asyncio.to_thread(self._get_updates_sync)
+                updates = await self._get_updates(client)
+            except (httpx.RequestError, TelegramPollingError, ValueError) as exc:
+                failures += 1
+                delay = min(3 * 2 ** min(failures - 1, 4), 30)
+                transient = isinstance(exc, httpx.RequestError) or (
+                    isinstance(exc, TelegramPollingError)
+                    and (exc.code >= 500 or exc.code == 429)
+                )
+                # HTTPX exception strings can contain the bot-token URL.
+                detail = (
+                    str(exc) if isinstance(exc, TelegramPollingError)
+                    else type(exc).__name__
+                )
+                if isinstance(exc, TelegramPollingError):
+                    delay = max(delay, exc.retry_after)
+                log = logger.warning if transient else logger.error
+                log(
+                    "Telegram command polling failed | error=%s | consecutive=%s | retry_in=%ss",
+                    detail, failures, delay,
+                )
+                if not transient or failures >= FAILURE_ALERT_THRESHOLD:
+                    await self._report_failure(f"{detail} | consecutive={failures}")
+                await self._wait_before_retry(delay)
+                continue
 
-                for update in updates:
+            if failures:
+                logger.info("Telegram command polling recovered | previous_failures=%s", failures)
+                failures = 0
+
+            for update in updates:
+                if not self.running:
+                    break
+                try:
                     await self._handle_update(update)
+                except Exception as exc:
+                    # An acknowledgement failure must not stop command reception.
+                    logger.error("Telegram command handling failed | error=%s", type(exc).__name__)
+                    await self._report_failure(f"Command handling: {type(exc).__name__}")
 
-            except asyncio.CancelledError:
-                raise
+    async def _report_failure(self, detail: str) -> None:
+        if self.on_failure:
+            try:
+                await self.on_failure(
+                    "telegram.commands", "[장애] Telegram 명령어 수신 실패", detail,
+                )
             except Exception as exc:
-                logger.exception("Telegram command polling failed")
+                logger.warning("Telegram failure alert delivery failed | error=%s", type(exc).__name__)
 
-                if self.on_failure:
-                    await self.on_failure(
-                        "telegram.commands",
-                        "[장애] Telegram 명령어 수신 실패",
-                        f"{type(exc).__name__}: {exc}",
-                    )
-
-                await asyncio.sleep(3)
+    async def _wait_before_retry(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
 
     async def stop(self) -> None:
         self.running = False
+        self._stop_event.set()
 
-    def _get_updates_sync(self) -> list[dict]:
+    async def _get_updates(self, client: httpx.AsyncClient) -> list[dict]:
         url = f"{TELEGRAM_API_BASE_URL}/bot{self.bot_token}/getUpdates"
-        query = urlencode(
-            {
-                "offset": self.last_update_id + 1,
-                "timeout": 10,
-            }
+        response = await client.get(
+            url, params={"offset": self.last_update_id + 1, "timeout": POLL_TIMEOUT_SECONDS},
         )
-        request = Request(f"{url}?{query}", method="GET")
-
-        with urlopen(request, timeout=15) as response:
-            body = response.read().decode("utf-8")
-
-        data = json.loads(body)
-
+        if response.status_code == 429:
+            try:
+                retry_after = float(response.json().get("parameters", {}).get("retry_after", 0))
+            except (ValueError, TypeError, AttributeError):
+                retry_after = 0
+            raise TelegramPollingError(429, retry_after)
+        if response.is_error:
+            raise TelegramPollingError(response.status_code)
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Invalid Telegram response")
         if not data.get("ok"):
-            raise RuntimeError(f"Telegram getUpdates rejected: {data}")
-
-        return data.get("result") or []
+            code = data.get("error_code", response.status_code)
+            if not isinstance(code, int):
+                raise ValueError("Invalid Telegram error code")
+            raise TelegramPollingError(code)
+        updates = data.get("result")
+        if not isinstance(updates, list) or any(not isinstance(update, dict) for update in updates):
+            raise ValueError("Invalid Telegram updates")
+        return updates
 
     async def _handle_update(self, update: dict) -> None:
         update_id = update.get("update_id")
