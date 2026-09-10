@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import threading
+import httpx
+from urllib.parse import urlsplit
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,6 +64,45 @@ class NamuClient:
         price: int,
     ) -> OrderSubmission:
         return await asyncio.to_thread(self._buy_stock_sync, stock_code, quantity, price)
+
+    # 세션 해제
+    async def reset_websocket_session(self) -> None:
+        host = urlsplit(self._base_url).hostname
+
+        if host not in {os.getenv("NHPLUG_AUTH_URL"), os.getenv("NHPLUG_BASE_URL")}:
+            raise RuntimeError("Invalid NHPLUG REST host")
+
+        url = f"https://{host}:8443/websocket/close/session"
+
+        # 토큰 조회부터 응답 확인까지 전체 제한 시간
+        async with asyncio.timeout(20):
+            token = await self.get_websocket_token()
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json;charset=utf-8",
+                    },
+                    json={},
+                )
+
+                response.raise_for_status()
+                data = response.json()
+
+            if not isinstance(data, dict):
+                raise RuntimeError("Invalid session reset response")
+
+            code = str(data.get("rsp_cd") or "")
+
+            if code != "00000":
+                raise RuntimeError(
+                    f"Namu session reset failed: {code} "
+                    f"{data.get('rsp_msg') or ''}"
+                )
+
+        logger.info("Namu websocket session reset succeeded")
 
     def _ensure_authenticated_sync(self) -> None:
         self._call("/n2/acctinfo", {})

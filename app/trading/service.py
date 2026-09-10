@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import asdict, dataclass
 from datetime import date
 from typing import Awaitable, Callable
@@ -73,11 +74,24 @@ class TradingService:
         socket_url = self.settings.namu.socket_url
 
         if self.fill_stream is None:
+            reset_enabled = (
+                os.getenv(
+                    "NAMU_WS_SESSION_RESET_ENABLED",
+                    "false",
+                ).strip().lower()
+                == "true"
+            )
+
             self.fill_stream = NamuFillWebSocketClient(
                 uri=socket_url,
                 token_provider=self.client.get_websocket_token,
                 on_fill=self.handle_fill_event,
                 on_failure=self.failure_handler,
+                session_resetter=(
+                    self.client.reset_websocket_session
+                    if reset_enabled
+                    else None
+                ),
             )
 
         self.fill_stream.start()
@@ -122,13 +136,16 @@ class TradingService:
         if _has_holding(holdings, stock_code):
             return self._skip(disclosure, "stock is already held")
 
+        # 주문 가능 금액
         cash_balance = account.cash_balance
+        logger.info(f"Automatic Buy Flow | stock={stock_name} | Orderable Amount={price}")
 
         if cash_balance < self.settings.risk.min_cash_balance:
             return self._skip(disclosure, "cash balance is below minimum")
 
         # 최우선 매도호가
         price = await self.client.get_best_ask_price(stock_code)
+        logger.info(f"Automatic Buy Flow | stock={stock_name} | Best ask price={price}")
 
         if price <= 0:
             return self._skip(disclosure, "best ask price is invalid")
@@ -269,6 +286,9 @@ class TradingService:
                 asdict(record)
                 for record in self.repository.recent_records()
             ],
+            "fill_stream_subscribed": bool(
+                self.fill_stream and self.fill_stream.subscribed
+            ),
         }
 
     def _skip(self, disclosure: dict, reason: str) -> TradingResult:

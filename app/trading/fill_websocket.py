@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 TokenProvider = Callable[[], Awaitable[str]]
 FillHandler = Callable[["FillEvent"], Awaitable[None]]
 FailureHandler = Callable[[str, str, str], Awaitable[None]]
+SessionResetter = Callable[[], Awaitable[None]]
 
 WS_ACK_OK = "00000"
 WS_PATH = "/websocket"
@@ -31,6 +32,12 @@ class FillEvent:
     filled_amount: int
     raw: dict
 
+class NamuSubscriptionError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(
+            f"Namu websocket subscribe failed: {code} {message}"
+        )
 
 class NamuFillWebSocketClient:
     def __init__(
@@ -39,6 +46,7 @@ class NamuFillWebSocketClient:
         token_provider: TokenProvider,
         on_fill: FillHandler,
         on_failure: FailureHandler | None = None,
+        session_resetter: SessionResetter | None = None,
     ):
         self.uri = uri
         self.token_provider = token_provider
@@ -47,6 +55,12 @@ class NamuFillWebSocketClient:
         self.websocket = None
         self.keep_running = False
         self.task: asyncio.Task | None = None
+        self.session_resetter = session_resetter
+        self.subscribed = False
+
+        self._retry_delay = 3.0
+        self._next_reset_at = 0.0
+        self._reset_cooldown = 300.0
 
     def start(self) -> None:
         if self.task and not self.task.done():
@@ -57,78 +71,190 @@ class NamuFillWebSocketClient:
 
     async def stop(self) -> None:
         self.keep_running = False
+        task = self.task
 
-        if self.websocket:
-            await self._unregister()
-            await self.websocket.close()
+        if task is None:
+            return
 
-        if self.task:
-            self.task.cancel()
+        try:
+            if self.websocket is not None and self.subscribed:
+                try:
+                    async with asyncio.timeout(3):
+                        await self._unregister()
+                except Exception:
+                    logger.warning(
+                        "Namu websocket unregister failed during stop"
+                    )
+        finally:
+            task.cancel()
 
             try:
-                await self.task
+                await task
             except asyncio.CancelledError:
                 pass
-
-            self.task = None
+            finally:
+                self.task = None
+                self.websocket = None
+                self.subscribed = False
 
     async def run(self) -> None:
         while self.keep_running:
             try:
                 await self._run_once()
+
             except asyncio.CancelledError:
                 raise
+
+            except NamuSubscriptionError as exc:
+                logger.warning("%s", exc)
+
+                if exc.code == "WSS10015" and self.keep_running:
+                    await self._reset_session_if_allowed()
+
+                await self._notify_failure(exc)
+
             except Exception as exc:
                 logger.exception("Namu fill websocket failed")
+                await self._notify_failure(exc)
 
-                if self.on_failure:
-                    await self.on_failure(
-                        "namu.fill_websocket",
-                        "[failure] Namu fill WebSocket failed",
-                        f"{type(exc).__name__}: {exc}",
-                    )
+            if not self.keep_running:
+                break
 
-                if self.keep_running:
-                    await asyncio.sleep(3)
+            delay = self._retry_delay
+            logger.info(
+                "Namu websocket reconnect scheduled | delay=%s",
+                delay,
+            )
+            await asyncio.sleep(delay)
+            self._retry_delay = min(delay * 2, 30.0)
+
+    async def _reset_session_if_allowed(self) -> None:
+        if not self.keep_running or self.session_resetter is None:
+            return
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        if now < self._next_reset_at:
+            logger.warning(
+                "Namu session reset deferred | remaining=%.1fs",
+                self._next_reset_at - now,
+            )
+            return
+
+        # 실패하더라도 곧바로 다시 초기화하지 않도록 먼저 기록
+        self._next_reset_at = now + self._reset_cooldown
+
+        try:
+            logger.warning("Namu websocket session reset requested")
+
+            async with asyncio.timeout(20):
+                await self.session_resetter()
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception("Namu websocket session reset failed")
+
+    async def _notify_failure(self, exc: Exception) -> None:
+        if not self.keep_running or self.on_failure is None:
+            return
+
+        try:
+            async with asyncio.timeout(10):
+                await self.on_failure(
+                    "namu.fill_websocket",
+                    "[failure] Namu fill WebSocket failed",
+                    f"{type(exc).__name__}: {exc}",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Namu websocket failure alert failed")
 
     async def _run_once(self) -> None:
-        try:
-            import websockets
-        except ImportError as exc:
-            raise RuntimeError("Install websockets to use Namu fill streaming") from exc
+        import websockets
+        from websockets.exceptions import ConnectionClosedOK
 
         token = await self.token_provider()
         url = self.uri or _default_websocket_url()
 
-        async with websockets.connect(
-            url,
-            ssl=_ssl_context(),
-            ping_interval=60,
-            ping_timeout=20,
-        ) as websocket:
-            self.websocket = websocket
-            logger.info("Namu fill websocket connected | url=%s", url)
+        try:
+            async with websockets.connect(
+                url,
+                ssl=_ssl_context(),
+                ping_interval=60,
+                ping_timeout=20,
+                close_timeout=5,
+                open_timeout=10,
+            ) as websocket:
+                self.websocket = websocket
+                self.subscribed = False
 
-            await self._register(token)
+                logger.info(
+                    "Namu fill websocket connected | url=%s",
+                    url,
+                )
 
-            async for message in websocket:
-                response = _parse_message(message)
+                await self._register(token)
 
-                if not response:
-                    continue
+                loop = asyncio.get_running_loop()
+                ack_deadline = loop.time() + 10.0
 
-                if _is_ack(response):
-                    _raise_for_ack(response)
-                    logger.info("Namu fill websocket subscription acknowledged")
-                    continue
+                while self.keep_running:
+                    if self.subscribed:
+                        # 구독 이후에는 체결이 없다고 연결을 끊지 않음
+                        message = await websocket.recv()
+                    else:
+                        # 최초 구독 응답에만 제한 시간 적용
+                        remaining = ack_deadline - loop.time()
 
-                logger.info("Namu fill websocket message: %s", response)
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "Namu subscription ACK timed out"
+                            )
 
-                for fill_event in extract_fill_events(response):
-                    await self.on_fill(fill_event)
+                        message = await asyncio.wait_for(
+                            websocket.recv(),
+                            timeout=remaining,
+                        )
 
-                if not self.keep_running:
-                    break
+                    response = _parse_message(message)
+
+                    if not response:
+                        continue
+
+                    if _is_ack(response):
+                        _raise_for_ack(response)
+
+                        header = response.get("header") or {}
+                        body = response.get("body") or {}
+
+                        if (
+                            str(header.get("tr_type")) == "1"
+                            and body.get("tr_cd", NOTICE_TR_CD)
+                            == NOTICE_TR_CD
+                        ):
+                            self.subscribed = True
+                            self._retry_delay = 3.0
+
+                            logger.info(
+                                "Namu fill websocket "
+                                "subscription acknowledged"
+                            )
+
+                        continue
+
+                    for event in extract_fill_events(response):
+                        await self.on_fill(event)
+
+        except ConnectionClosedOK:
+            logger.info("Namu fill websocket closed normally")
+
+        finally:
+            self.websocket = None
+            self.subscribed = False
 
     async def _register(self, token: str) -> None:
         await self._send(
@@ -247,9 +373,11 @@ def _raise_for_ack(message: dict) -> None:
     header = message.get("header") or {}
     code = str(header.get("rsp_cd") or "")
 
-    if code and code != WS_ACK_OK:
-        raise RuntimeError(f"Namu websocket subscribe failed: {code} {header.get('rsp_msg') or ''}")
-
+    if code != WS_ACK_OK:
+        raise NamuSubscriptionError(
+            code=code or "MISSING_ACK_CODE",
+            message=str(header.get("rsp_msg") or ""),
+        )
 
 def _iter_payload_rows(value) -> list[dict]:
     if isinstance(value, dict):
