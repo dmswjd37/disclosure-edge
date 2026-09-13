@@ -65,11 +65,11 @@ class NamuClient:
     ) -> OrderSubmission:
         return await asyncio.to_thread(self._buy_stock_sync, stock_code, quantity, price)
 
-    # 세션 해제
+    # 실시간(Websocket) 세션해제
     async def reset_websocket_session(self) -> None:
         host = urlsplit(self._base_url).hostname
 
-        if host not in {os.getenv("NHPLUG_AUTH_URL"), os.getenv("NHPLUG_BASE_URL")}:
+        if host not in {"api.nhplug.com", "moapi.nhplug.com"}:
             raise RuntimeError("Invalid NHPLUG REST host")
 
         url = f"https://{host}:8443/websocket/close/session"

@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import ssl
+import re
+from datetime import datetime, time, timedelta
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit
@@ -20,7 +22,23 @@ WS_PATH = "/websocket"
 PORT_DOMESTIC = "7070"
 PORT_MOCK = "17070"
 NOTICE_TR_CD = "d2"
+DART_POLLING_START_ENV = "DART_POLLING_START"
+DART_POLLING_END_ENV = "DART_POLLING_END"
+DART_POLLING_WEEKDAYS_ONLY_ENV = "DART_POLLING_WEEKDAYS_ONLY"
 
+def _parse_time(value: str, env_name: str) -> time:
+        match = re.fullmatch(r"(\d{2}):(\d{2})", value.strip())
+
+        if not match:
+            raise RuntimeError(f"{env_name} must be HH:MM")
+
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+
+        if hour > 23 or minute > 59:
+            raise RuntimeError(f"{env_name} must be HH:MM")
+
+        return time(hour=hour, minute=minute)
 
 @dataclass(frozen=True)
 class FillEvent:
@@ -62,6 +80,19 @@ class NamuFillWebSocketClient:
         self._next_reset_at = 0.0
         self._reset_cooldown = 300.0
 
+        self.polling_start = _parse_time(
+            os.getenv(DART_POLLING_START_ENV, "09:00"),
+            DART_POLLING_START_ENV,
+        )
+        self.polling_end = _parse_time(
+            os.getenv(DART_POLLING_END_ENV, "15:30"),
+            DART_POLLING_END_ENV,
+        )
+        self.polling_weekdays_only = os.getenv(
+            DART_POLLING_WEEKDAYS_ONLY_ENV,
+            "true",
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+
     def start(self) -> None:
         if self.task and not self.task.done():
             return
@@ -97,7 +128,81 @@ class NamuFillWebSocketClient:
                 self.websocket = None
                 self.subscribed = False
 
+    def _is_connection_time(self, now: datetime) -> bool:
+        if self.polling_weekdays_only and now.weekday() >= 5:
+            return False
+
+        return self.polling_start <= now.time() < self.polling_end
+
+    def _next_connection_start(self, now: datetime) -> datetime:
+        next_start = datetime.combine(
+            now.date(),
+            self.polling_start,
+        )
+
+        if next_start <= now:
+            next_start += timedelta(days=1)
+
+        while self.polling_weekdays_only and next_start.weekday() >= 5:
+            next_start += timedelta(days=1)
+
+        return next_start
+
     async def run(self) -> None:
+        waiting_logged = False
+
+        while self.keep_running:
+            now = datetime.now()
+
+            # 접속 시간 밖에서는 연결하지 않고 대기
+            if not self._is_connection_time(now):
+                next_start = self._next_connection_start(now)
+
+                if not waiting_logged:
+                    logger.info(
+                        "Namu websocket waiting | next_start=%s",
+                        next_start.isoformat(timespec="seconds"),
+                    )
+                    waiting_logged = True
+
+                wait_seconds = (next_start - now).total_seconds()
+
+                await asyncio.sleep(
+                    min(60.0, max(0.1, wait_seconds))
+                )
+                continue
+
+            waiting_logged = False
+            self._retry_delay = 3.0
+
+            end_at = datetime.combine(
+                now.date(),
+                self.polling_end,
+            )
+            remaining = (end_at - now).total_seconds()
+
+            logger.info(
+                "Namu websocket operating window started | end=%s",
+                end_at.isoformat(timespec="seconds"),
+            )
+
+            # 종료 시간이 되면 수신·재접속 작업을 취소
+            window_timeout = asyncio.timeout(remaining)
+
+            try:
+                async with window_timeout:
+                    await self._run_during_window()
+
+            except TimeoutError:
+                # 다른 원인의 TimeoutError를 시간 종료로 숨기지 않음
+                if not window_timeout.expired():
+                    raise
+
+                logger.info(
+                    "Namu websocket operating window ended"
+                )
+
+    async def _run_during_window(self) -> None:
         while self.keep_running:
             try:
                 await self._run_once()
@@ -121,6 +226,7 @@ class NamuFillWebSocketClient:
                 break
 
             delay = self._retry_delay
+            # “3초 뒤에 재접속을 시도하겠다”는 안내 로그
             logger.info(
                 "Namu websocket reconnect scheduled | delay=%s",
                 delay,
@@ -157,6 +263,7 @@ class NamuFillWebSocketClient:
         except Exception:
             logger.exception("Namu websocket session reset failed")
 
+    # 실패 알림
     async def _notify_failure(self, exc: Exception) -> None:
         if not self.keep_running or self.on_failure is None:
             return

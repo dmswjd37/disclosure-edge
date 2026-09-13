@@ -138,7 +138,7 @@ class TradingService:
 
         # 주문 가능 금액
         cash_balance = account.cash_balance
-        logger.info(f"Automatic Buy Flow | stock={stock_name} | Orderable Amount={price}")
+        logger.info(f"Automatic Buy Flow | stock={stock_name} | Orderable Amount={cash_balance}")
 
         if cash_balance < self.settings.risk.min_cash_balance:
             return self._skip(disclosure, "cash balance is below minimum")
