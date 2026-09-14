@@ -235,7 +235,16 @@ class NamuFillWebSocketClient:
             self._retry_delay = min(delay * 2, 30.0)
 
     async def _reset_session_if_allowed(self) -> None:
-        if not self.keep_running or self.session_resetter is None:
+        if not self.keep_running:
+            logger.info("Namu session reset skipped | stopping")
+            return
+
+        if self.session_resetter is None:
+            logger.warning(
+                "Namu session reset skipped | "
+                "session_resetter is None; "
+                "check NAMU_WS_SESSION_RESET_ENABLED"
+            )
             return
 
         loop = asyncio.get_running_loop()
