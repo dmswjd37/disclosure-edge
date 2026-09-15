@@ -88,6 +88,30 @@ class NamuClient:
                     json={},
                 )
 
+                if response.is_error:
+                    try:
+                        error_data = response.json()
+                    except ValueError:
+                        error_data = {}
+                
+                    if not isinstance(error_data, dict):
+                        error_data = {}
+                
+                    error_message = str(
+                        error_data.get("rsp_msg")
+                        or error_data.get("message")
+                        or "오류 메시지 필드 없음"
+                    )
+                
+                    logger.error(
+                        "Namu session reset HTTP error | "
+                        "status=%s | content_type=%s | rsp_cd=%s | message=%r",
+                        response.status_code,
+                        response.headers.get("content-type"),
+                        str(error_data.get("rsp_cd") or "")[:100],
+                        error_message[:2000],
+                    )
+
                 response.raise_for_status()
                 data = response.json()
 
