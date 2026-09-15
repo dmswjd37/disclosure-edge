@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import threading
-import httpx
+import requests
 from urllib.parse import urlsplit
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -73,58 +73,44 @@ class NamuClient:
             raise RuntimeError("Invalid NHPLUG REST host")
 
         url = f"https://{host}:8443/websocket/close/session"
+        token = await self.get_websocket_token()
 
-        # 토큰 조회부터 응답 확인까지 전체 제한 시간
-        async with asyncio.timeout(20):
-            token = await self.get_websocket_token()
+        response = await asyncio.to_thread(
+            requests.post,
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json;charset=UTF-8",
+            },
+            data=b"",       # 요청 본문 없음
+            timeout=10,
+        )
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json;charset=utf-8",
-                    },
-                    json={},
-                )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
 
-                if response.is_error:
-                    try:
-                        error_data = response.json()
-                    except ValueError:
-                        error_data = {}
-                
-                    if not isinstance(error_data, dict):
-                        error_data = {}
-                
-                    error_message = str(
-                        error_data.get("rsp_msg")
-                        or error_data.get("message")
-                        or "오류 메시지 필드 없음"
-                    )
-                
-                    logger.error(
-                        "Namu session reset HTTP error | "
-                        "status=%s | content_type=%s | rsp_cd=%s | message=%r",
-                        response.status_code,
-                        response.headers.get("content-type"),
-                        str(error_data.get("rsp_cd") or "")[:100],
-                        error_message[:2000],
-                    )
+        rsp_cd = data.get("rsp_cd")
+        rsp_msg = data.get("rsp_msg")
 
-                response.raise_for_status()
-                data = response.json()
+        if not response.ok:
+            logger.error(
+                "Namu session reset HTTP error | "
+                "status=%s | content_type=%s | rsp_cd=%s | message=%r",
+                response.status_code,
+                response.headers.get("content-type"),
+                rsp_cd,
+                rsp_msg,
+            )
+            response.raise_for_status()
 
-            if not isinstance(data, dict):
-                raise RuntimeError("Invalid session reset response")
-
-            code = str(data.get("rsp_cd") or "")
-
-            if code != "00000":
-                raise RuntimeError(
-                    f"Namu session reset failed: {code} "
-                    f"{data.get('rsp_msg') or ''}"
-                )
+        logger.info(
+            "Namu websocket session reset completed | "
+            "rsp_cd=%s | message=%s",
+            rsp_cd,
+            rsp_msg,
+        )
 
         logger.info("Namu websocket session reset succeeded")
 

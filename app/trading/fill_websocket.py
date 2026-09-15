@@ -95,6 +95,7 @@ class NamuFillWebSocketClient:
 
     def start(self) -> None:
         if self.task and not self.task.done():
+            logger.warning("Namu fill websocket is already running")
             return
 
         self.keep_running = True
