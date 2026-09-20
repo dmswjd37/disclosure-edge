@@ -112,15 +112,6 @@ class NamuClient:
                 f"{rsp_cd} {rsp_msg or ''}"
             )
 
-        logger.info(
-            "Namu websocket session reset completed | "
-            "rsp_cd=%s | message=%s",
-            rsp_cd,
-            rsp_msg,
-        )
-
-        logger.info("Namu websocket session reset succeeded")
-
     def _ensure_authenticated_sync(self) -> None:
         self._call("/n2/acctinfo", {})
 
