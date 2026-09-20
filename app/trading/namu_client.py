@@ -105,6 +105,13 @@ class NamuClient:
             )
             response.raise_for_status()
 
+        # HTTP 200이어도 세션 해제 업무가 실패한 경우
+        if rsp_cd != "00000":
+            raise RuntimeError(
+                "Namu websocket session reset rejected: "
+                f"{rsp_cd} {rsp_msg or ''}"
+            )
+
         logger.info(
             "Namu websocket session reset completed | "
             "rsp_cd=%s | message=%s",
