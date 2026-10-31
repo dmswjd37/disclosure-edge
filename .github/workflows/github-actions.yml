@@ -39,6 +39,8 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run tests
+        env:
+          DART_TARGET_REPORT_NAMES: ${{ vars.DART_TARGET_REPORT_NAMES }}
         run: python -m pytest -q
 
   deploy:
