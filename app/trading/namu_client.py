@@ -210,6 +210,7 @@ class NamuClient:
             ),
         )
 
+    # 잔고 조회
     def _balance(self) -> dict:
         return self._call(
             "/krstock/inquiry/v1/balance",
@@ -219,6 +220,7 @@ class NamuClient:
                 "ltg_aot_dit_cd": "9",
                 "aet_bse": "2",
                 "qut_dit_cd": self._market_cd,
+                "aly_qut_cd": "1",
             },
         )
 
