@@ -158,6 +158,7 @@ class NamuClient:
         summary = data.get("Output_0") or {}
         return _to_int(summary.get("dca"))
 
+    # 국내_주식_시세_현재가
     def _get_best_ask_price_sync(self, stock_code: str) -> int:
         data = self._call(
             "/krstock/quote/v1/currentPrice",
@@ -168,8 +169,16 @@ class NamuClient:
             base_url=self._quote_base_url,
         )
         quote = data.get("Output_0") or {}
+        ask_price = _to_int(quote.get("askp1"))
 
-        return _first_int(quote, "askp1", "askp", "stck_prpr", "bidp1", "bidp")
+        logger.info(
+            "Namu best ask price | stock_code=%s | askp1=%s",
+            stock_code,
+            ask_price,
+        )
+
+        return ask_price
+        # return _first_int(quote, "askp1", "askp", "stck_prpr", "bidp1", "bidp")
 
     def _buy_stock_sync(
         self,
